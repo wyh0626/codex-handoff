@@ -1,0 +1,131 @@
+name: Release codex-handoff
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Test
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, format: targz }
+          - { goos: linux, goarch: arm64, format: targz }
+          - { goos: darwin, goarch: amd64, format: targz }
+          - { goos: darwin, goarch: arm64, format: targz }
+          - { goos: windows, goarch: amd64, format: zip }
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Build and package
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="v0.0.0-dryrun-${GITHUB_SHA::7}"
+          fi
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          dir="codex-handoff_${version}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/$dir"
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/ahmojo/codex-claude-transfer/internal/cli.Version=${version}" \
+            -o "dist/$dir/codex-handoff${ext}" ./cmd/codex-handoff
+          cp README.md README-HANDOFF.zh-CN.md LICENSE "dist/$dir/"
+          if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "amd64" ]; then
+            "dist/$dir/codex-handoff" version
+          fi
+          if [ "${{ matrix.format }}" = "zip" ]; then
+            (cd dist && zip -qr "codex-handoff_${GOOS}_${GOARCH}.zip" "$dir")
+          else
+            (cd dist && tar -czf "codex-handoff_${GOOS}_${GOARCH}.tar.gz" "$dir")
+          fi
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: codex-handoff_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble release files
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate and verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum codex-handoff_* > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Upload release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-files
+          path: dist/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: assemble
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-files
+          path: dist
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag

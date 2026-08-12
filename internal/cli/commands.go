@@ -1,0 +1,1905 @@
+// Package cli implements the cct command-line interface. The CLI is a
+// thin layer over the reusable core packages (codexhome, sessions, doctor) so
+// the same core can later back a desktop app.
+package cli
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/ahmojo/codex-claude-transfer/internal/agent"
+	"github.com/ahmojo/codex-claude-transfer/internal/bundle"
+	"github.com/ahmojo/codex-claude-transfer/internal/claudehome"
+	"github.com/ahmojo/codex-claude-transfer/internal/claudesessions"
+	"github.com/ahmojo/codex-claude-transfer/internal/codexhome"
+	"github.com/ahmojo/codex-claude-transfer/internal/codexreconcile"
+	"github.com/ahmojo/codex-claude-transfer/internal/crypt"
+	"github.com/ahmojo/codex-claude-transfer/internal/doctor"
+	"github.com/ahmojo/codex-claude-transfer/internal/git"
+	"github.com/ahmojo/codex-claude-transfer/internal/handoff"
+	"github.com/ahmojo/codex-claude-transfer/internal/lansync"
+	"github.com/ahmojo/codex-claude-transfer/internal/repair"
+	"github.com/ahmojo/codex-claude-transfer/internal/search"
+	"github.com/ahmojo/codex-claude-transfer/internal/secrets"
+	"github.com/ahmojo/codex-claude-transfer/internal/sessions"
+	"github.com/ahmojo/codex-claude-transfer/internal/webui"
+)
+
+// Run parses args (excluding the program name) and executes the requested
+// command, writing to stdout/stderr. It returns a process exit code.
+func Run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		printUsage(stderr)
+		return 2
+	}
+
+	command := args[0]
+	rest := args[1:]
+
+	switch command {
+	case "doctor":
+		return runDoctor(rest, stdout, stderr)
+	case "list":
+		return runList(rest, stdout, stderr)
+	case "search":
+		return runSearch(rest, stdout, stderr)
+	case "scan":
+		return runScan(rest, stdout, stderr)
+	case "stats":
+		return runStats(rest, stdout, stderr)
+	case "resume":
+		return runResume(rest, stdout, stderr)
+	case "browse":
+		return runBrowse(rest, stdout, stderr)
+	case "tag":
+		return runTag(rest, stdout, stderr)
+	case "name":
+		return runName(rest, stdout, stderr)
+	case "config":
+		return runConfig(rest, stdout, stderr)
+	case "skill":
+		return runSkill(rest, stdout, stderr)
+	case "export":
+		return runExport(rest, stdout, stderr)
+	case "inspect":
+		return runInspect(rest, stdout, stderr)
+	case "import":
+		return runImport(rest, stdout, stderr)
+	case "relocate":
+		return runRelocate(rest, stdout, stderr)
+	case "diff":
+		return runDiff(rest, stdout, stderr)
+	case "undo":
+		return runUndo(rest, stdout, stderr)
+	case "repair-times":
+		return runRepairTimes(rest, stdout, stderr)
+	case "sync":
+		return runSync(rest, stdout, stderr)
+	case "ui":
+		return runUI(rest, stdout, stderr)
+	case "handoff":
+		return runHandoffUI(rest, stdout, stderr)
+	case "app":
+		return runApp(rest, stdout, stderr)
+	case "version", "--version", "-V":
+		printVersion(stdout)
+		return 0
+	case "completion":
+		return runCompletion(rest, stdout, stderr)
+	case "help", "-h", "--help":
+		printUsage(stdout)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "unknown command: %q\n\n", command)
+		printUsage(stderr)
+		return 2
+	}
+}
+
+// commonFlags holds flags shared by commands.
+type commonFlags struct {
+	codexHome       string
+	claudeHome      string
+	tool            string
+	to              string
+	includeArchived bool
+	project         string
+	projects        []string
+	projectGit      []string
+	output          string
+	dryRun          bool
+	all             bool
+	since           string
+	sessions        []string
+	withGit         bool
+	gitPush         bool
+	stripImages     bool
+	cloneDir        string
+	mapCWD          []string
+	mapCWDHere      bool
+	encryptTo       []string
+	recipientsFile  string
+	passphrase      bool
+	identity        string
+	replaceBackup   bool
+	importAsCopy    bool
+	merge           bool
+	reconcile       bool
+	flat            bool
+	jsonOut         bool
+	code            string
+	allowPublic     bool
+	pullOnly        bool
+	pushOnly        bool
+	iUnderstand     bool
+	regex           bool
+	caseSensitive   bool
+	match           string
+	format          string
+	redact          bool
+	remember        bool
+	allowSecrets    bool
+	run             bool
+	once            bool
+	interval        int
+	port            int
+	noBrowser       bool
+	list            bool
+	force           bool
+	plain           bool
+	withMemory      bool
+	handoffMode     bool
+	repo            string
+	positional      []string
+}
+
+// parseFlags is a tiny, dependency-free flag parser for the flags we support in
+// v0.1. Unknown flags are reported as errors.
+func parseFlags(args []string) (commonFlags, error) {
+	var f commonFlags
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--codex-home":
+			val, err := takeValue(args, &i, "--codex-home")
+			if err != nil {
+				return f, err
+			}
+			f.codexHome = val
+		case hasPrefix(arg, "--codex-home="):
+			f.codexHome = arg[len("--codex-home="):]
+		case arg == "--claude-home":
+			val, err := takeValue(args, &i, "--claude-home")
+			if err != nil {
+				return f, err
+			}
+			f.claudeHome = val
+		case hasPrefix(arg, "--claude-home="):
+			f.claudeHome = arg[len("--claude-home="):]
+		case arg == "--tool":
+			val, err := takeValue(args, &i, "--tool")
+			if err != nil {
+				return f, err
+			}
+			f.tool = val
+		case hasPrefix(arg, "--tool="):
+			f.tool = arg[len("--tool="):]
+		case arg == "--to":
+			val, err := takeValue(args, &i, "--to")
+			if err != nil {
+				return f, err
+			}
+			f.to = val
+		case hasPrefix(arg, "--to="):
+			f.to = arg[len("--to="):]
+		case arg == "--project":
+			val, err := takeValue(args, &i, "--project")
+			if err != nil {
+				return f, err
+			}
+			f.project = val
+			f.projects = append(f.projects, val)
+		case hasPrefix(arg, "--project="):
+			f.project = arg[len("--project="):]
+			f.projects = append(f.projects, f.project)
+		case arg == "--project-git":
+			val, err := takeValue(args, &i, "--project-git")
+			if err != nil {
+				return f, err
+			}
+			f.projectGit = append(f.projectGit, val)
+		case hasPrefix(arg, "--project-git="):
+			f.projectGit = append(f.projectGit, arg[len("--project-git="):])
+		case arg == "--output" || arg == "-o":
+			val, err := takeValue(args, &i, arg)
+			if err != nil {
+				return f, err
+			}
+			f.output = val
+		case hasPrefix(arg, "--output="):
+			f.output = arg[len("--output="):]
+		case arg == "--map-cwd":
+			val, err := takeValue(args, &i, "--map-cwd")
+			if err != nil {
+				return f, err
+			}
+			f.mapCWD = append(f.mapCWD, val)
+		case hasPrefix(arg, "--map-cwd="):
+			f.mapCWD = append(f.mapCWD, arg[len("--map-cwd="):])
+		case arg == "--map-cwd-here":
+			f.mapCWDHere = true
+		case arg == "--code":
+			val, err := takeValue(args, &i, "--code")
+			if err != nil {
+				return f, err
+			}
+			f.code = val
+		case hasPrefix(arg, "--code="):
+			f.code = arg[len("--code="):]
+		case arg == "--allow-public":
+			f.allowPublic = true
+		case arg == "--pull-only":
+			f.pullOnly = true
+		case arg == "--push-only":
+			f.pushOnly = true
+		case arg == "--i-understand":
+			f.iUnderstand = true
+		case arg == "--regex":
+			f.regex = true
+		case arg == "--case-sensitive":
+			f.caseSensitive = true
+		case arg == "--match":
+			val, err := takeValue(args, &i, "--match")
+			if err != nil {
+				return f, err
+			}
+			f.match = val
+		case hasPrefix(arg, "--match="):
+			f.match = arg[len("--match="):]
+		case arg == "--format":
+			val, err := takeValue(args, &i, "--format")
+			if err != nil {
+				return f, err
+			}
+			f.format = val
+		case hasPrefix(arg, "--format="):
+			f.format = arg[len("--format="):]
+		case arg == "--force":
+			f.force = true
+		case arg == "--repo":
+			val, err := takeValue(args, &i, "--repo")
+			if err != nil {
+				return f, err
+			}
+			f.repo = val
+		case hasPrefix(arg, "--repo="):
+			f.repo = arg[len("--repo="):]
+		case arg == "--plain":
+			f.plain = true
+		case arg == "--redact":
+			f.redact = true
+		case arg == "--remember":
+			f.remember = true
+		case arg == "--allow-secrets":
+			f.allowSecrets = true
+		case arg == "--run":
+			f.run = true
+		case arg == "--once":
+			f.once = true
+		case arg == "--interval":
+			val, err := takeValue(args, &i, "--interval")
+			if err != nil {
+				return f, err
+			}
+			n, perr := strconv.Atoi(val)
+			if perr != nil || n < 1 {
+				return f, fmt.Errorf("invalid --interval %q (want a positive number of seconds)", val)
+			}
+			f.interval = n
+		case hasPrefix(arg, "--interval="):
+			val := arg[len("--interval="):]
+			n, perr := strconv.Atoi(val)
+			if perr != nil || n < 1 {
+				return f, fmt.Errorf("invalid --interval %q (want a positive number of seconds)", val)
+			}
+			f.interval = n
+		case arg == "--all":
+			f.all = true
+		case arg == "--since":
+			val, err := takeValue(args, &i, "--since")
+			if err != nil {
+				return f, err
+			}
+			f.since = val
+		case hasPrefix(arg, "--since="):
+			f.since = arg[len("--since="):]
+		case arg == "--session":
+			val, err := takeValue(args, &i, "--session")
+			if err != nil {
+				return f, err
+			}
+			f.sessions = append(f.sessions, val)
+		case hasPrefix(arg, "--session="):
+			f.sessions = append(f.sessions, arg[len("--session="):])
+		case arg == "--with-memory":
+			f.withMemory = true
+		case arg == "--with-git":
+			f.withGit = true
+		case arg == "--git-push":
+			f.gitPush = true
+		case arg == "--strip-images":
+			f.stripImages = true
+		case arg == "--clone":
+			val, err := takeValue(args, &i, "--clone")
+			if err != nil {
+				return f, err
+			}
+			f.cloneDir = val
+		case hasPrefix(arg, "--clone="):
+			f.cloneDir = arg[len("--clone="):]
+		case arg == "--encrypt-to":
+			val, err := takeValue(args, &i, "--encrypt-to")
+			if err != nil {
+				return f, err
+			}
+			f.encryptTo = append(f.encryptTo, val)
+		case hasPrefix(arg, "--encrypt-to="):
+			f.encryptTo = append(f.encryptTo, arg[len("--encrypt-to="):])
+		case arg == "--recipients-file":
+			val, err := takeValue(args, &i, "--recipients-file")
+			if err != nil {
+				return f, err
+			}
+			f.recipientsFile = val
+		case hasPrefix(arg, "--recipients-file="):
+			f.recipientsFile = arg[len("--recipients-file="):]
+		case arg == "--passphrase":
+			f.passphrase = true
+		case arg == "--identity":
+			val, err := takeValue(args, &i, "--identity")
+			if err != nil {
+				return f, err
+			}
+			f.identity = val
+		case hasPrefix(arg, "--identity="):
+			f.identity = arg[len("--identity="):]
+		case arg == "--replace-with-backup":
+			f.replaceBackup = true
+		case arg == "--import-as-copy":
+			f.importAsCopy = true
+		case arg == "--merge":
+			f.merge = true
+		case arg == "--reconcile":
+			f.reconcile = true
+		case arg == "--flat":
+			f.flat = true
+		case arg == "--include-archived":
+			f.includeArchived = true
+		case arg == "--json":
+			f.jsonOut = true
+		case arg == "--no-browser":
+			f.noBrowser = true
+		case arg == "--list":
+			f.list = true
+		case arg == "--port":
+			val, err := takeValue(args, &i, "--port")
+			if err != nil {
+				return f, err
+			}
+			n, perr := strconv.Atoi(val)
+			if perr != nil || n < 0 || n > 65535 {
+				return f, fmt.Errorf("invalid --port %q", val)
+			}
+			f.port = n
+		case hasPrefix(arg, "--port="):
+			val := arg[len("--port="):]
+			n, perr := strconv.Atoi(val)
+			if perr != nil || n < 0 || n > 65535 {
+				return f, fmt.Errorf("invalid --port %q", val)
+			}
+			f.port = n
+		case arg == "--dry-run":
+			f.dryRun = true
+		case hasPrefix(arg, "-"):
+			return f, fmt.Errorf("unknown flag: %q", arg)
+		default:
+			f.positional = append(f.positional, arg)
+		}
+	}
+	return f, nil
+}
+
+// takeValue consumes the next arg as the value for flagName, advancing i.
+func takeValue(args []string, i *int, flagName string) (string, error) {
+	if *i+1 >= len(args) {
+		return "", fmt.Errorf("%s requires a value", flagName)
+	}
+	*i++
+	return args[*i], nil
+}
+
+func resolveHome(f commonFlags, stderr io.Writer) (codexhome.Home, bool) {
+	home, err := codexhome.Detect(defaultCodexHome(f.codexHome))
+	if err != nil {
+		fmt.Fprintf(stderr, "error: cannot determine Codex home: %v\n", err)
+		return codexhome.Home{}, false
+	}
+	return home, true
+}
+
+func resolveClaudeHome(f commonFlags, stderr io.Writer) (claudehome.Home, bool) {
+	home, err := claudehome.Detect(defaultClaudeHome(f.claudeHome))
+	if err != nil {
+		fmt.Fprintf(stderr, "error: cannot determine Claude Code home: %v\n", err)
+		return claudehome.Home{}, false
+	}
+	return home, true
+}
+
+// resolveTool decides which agent a command targets. An explicit --tool wins;
+// otherwise it auto-detects: if a Claude Code home exists and a Codex home does
+// not, it picks Claude, else it defaults to Codex (the original, backward-
+// compatible behavior). The returned bool is false when --tool is invalid.
+func resolveTool(f commonFlags, stderr io.Writer) (agent.Kind, bool) {
+	if f.tool != "" {
+		kind, err := agent.Parse(f.tool)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return "", false
+		}
+		return kind, true
+	}
+	// A saved default tool sits between an explicit --tool and auto-detection.
+	if dt := loadDefaults().Tool; dt != "" {
+		if kind, err := agent.Parse(dt); err == nil {
+			return kind, true
+		}
+	}
+	ch, _ := codexhome.Detect(defaultCodexHome(f.codexHome))
+	clh, _ := claudehome.Detect(defaultClaudeHome(f.claudeHome))
+	if clh.RootExists() && !ch.RootExists() {
+		return agent.Claude, true
+	}
+	return agent.Codex, true
+}
+
+// resolveImportTarget reads the bundle's recorded tool and returns the matching
+// destination home (as a codexhome.Home carrier whose Root is the agent's home).
+// The bundle, not --tool, is authoritative; a disagreeing --tool is reported and
+// ignored so a bundle is always written to the right place.
+func resolveImportTarget(f commonFlags, bundlePath string, stderr io.Writer) (agent.Kind, codexhome.Home, bool) {
+	insp, err := bundle.Inspect(bundlePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return "", codexhome.Home{}, false
+	}
+	kind := agent.Normalize(agent.Kind(insp.Manifest.Tool))
+	if f.tool != "" {
+		if want, perr := agent.Parse(f.tool); perr == nil && want != kind {
+			fmt.Fprintf(stderr, "note: --tool %s ignored; this bundle contains %s sessions\n", want, kind.Label())
+		}
+	}
+	if kind == agent.Claude {
+		clh, ok := resolveClaudeHome(f, stderr)
+		if !ok {
+			return "", codexhome.Home{}, false
+		}
+		return kind, codexhome.Home{Root: clh.Root, SessionsDir: clh.ProjectsDir, Source: clh.Source}, true
+	}
+	home, ok := resolveHome(f, stderr)
+	if !ok {
+		return "", codexhome.Home{}, false
+	}
+	return kind, home, true
+}
+
+// runApp launches the local desktop GUI: a loopback-only web server the user
+// drives from their browser. It blocks until interrupted.
+func runApp(args []string, stdout, stderr io.Writer) int {
+	f, err := parseFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	port := f.port
+	if port == 0 {
+		port = loadDefaults().Port
+	}
+	return webui.Run(webui.Options{
+		CodexHome:  f.codexHome,
+		ClaudeHome: f.claudeHome,
+		Port:       port,
+		NoBrowser:  f.noBrowser,
+	}, stdout, stderr)
+}
+
+func runDoctor(args []string, stdout, stderr io.Writer) int {
+	f, err := parseFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	kind, ok := resolveTool(f, stderr)
+	if !ok {
+		return 2
+	}
+	var report doctor.Report
+	if kind == agent.Claude {
+		home, ok := resolveClaudeHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		report = doctor.RunClaude(home)
+	} else {
+		home, ok := resolveHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		report = doctor.Run(home)
+	}
+	if f.jsonOut {
+		printDoctorJSON(stdout, report)
+	} else {
+		printReport(stdout, report)
+	}
+	return 0
+}
+
+func runList(args []string, stdout, stderr io.Writer) int {
+	f, err := parseFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	kind, ok := resolveTool(f, stderr)
+	if !ok {
+		return 2
+	}
+	var scan sessions.ScanResult
+	if kind == agent.Claude {
+		home, ok := resolveClaudeHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		scan, err = claudesessions.Scan(home, claudesessions.ScanOptions{IncludeArchived: f.includeArchived})
+	} else {
+		home, ok := resolveHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		scan, err = sessions.Scan(home, sessions.ScanOptions{
+			IncludeArchived:      f.includeArchived,
+			DecompressCompressed: true,
+		})
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "error: scan failed: %v\n", err)
+		return 1
+	}
+	if f.jsonOut {
+		printListJSON(stdout, scan)
+	} else {
+		printList(stdout, kind, scan, f.flat)
+	}
+	return 0
+}
+
+// runSearch performs full-text search across local sessions.
+func runSearch(args []string, stdout, stderr io.Writer) int {
+	f, err := parseFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	if len(f.positional) != 1 || strings.TrimSpace(f.positional[0]) == "" {
+		fmt.Fprintln(stderr, "usage: cct search <query> [--regex] [--case-sensitive] [--tool codex|claude] [--project <path>] [--since <when>] [--json]")
+		return 2
+	}
+	kind, ok := resolveTool(f, stderr)
+	if !ok {
+		return 2
+	}
+	scan, code := scanForSearch(f, kind, stderr)
+	if code != 0 {
+		return code
+	}
+	candidates := filterForSearch(f, scan.Sessions, stderr)
+	matches, err := search.Search(candidates, search.Query{
+		Text:          f.positional[0],
+		Regex:         f.regex,
+		CaseSensitive: f.caseSensitive,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	compressedSkipped := countCompressedSessions(candidates)
+	if f.jsonOut {
+		printSearchJSON(stdout, matches, compressedSkipped)
+	} else {
+		printSearch(stdout, kind, f.positional[0], matches)
+		printCompressedSkipNote(stdout, compressedSkipped)
+	}
+	return 0
+}
+
+// scanForSearch scans the right home for search/match.
+func scanForSearch(f commonFlags, kind agent.Kind, stderr io.Writer) (sessions.ScanResult, int) {
+	var scan sessions.ScanResult
+	var err error
+	if kind == agent.Claude {
+		home, ok := resolveClaudeHome(f, stderr)
+		if !ok {
+			return scan, 1
+		}
+		scan, err = claudesessions.Scan(home, claudesessions.ScanOptions{IncludeArchived: f.includeArchived})
+	} else {
+		home, ok := resolveHome(f, stderr)
+		if !ok {
+			return scan, 1
+		}
+		scan, err = sessions.Scan(home, sessions.ScanOptions{IncludeArchived: f.includeArchived, DecompressCompressed: true})
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "error: scan failed: %v\n", err)
+		return scan, 1
+	}
+	return scan, 0
+}
+
+// filterForSearch applies the --project and --since filters before searching.
+func filterForSearch(f commonFlags, list []sessions.Session, stderr io.Writer) []sessions.Session {
+	var since time.Time
+	if f.since != "" {
+		if t, err := parseSince(f.since); err == nil {
+			since = t
+		}
+	}
+	var absProject string
+	if f.project != "" {
+		absProject, _ = filepath.Abs(f.project)
+	}
+	out := make([]sessions.Session, 0, len(list))
+	for _, s := range list {
+		if !since.IsZero() && s.ModTime.Before(since) {
+			continue
+		}
+		if absProject != "" && (s.CWD == "" || !pathEqualCLI(s.CWD, absProject)) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// runScan checks local sessions for likely secrets (API keys, tokens, private
+// keys) so you can review them before sharing or syncing. Read-only.
+func runScan(args []string, stdout, stderr io.Writer) int {
+	f, err := parseFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	kind, ok := resolveTool(f, stderr)
+	if !ok {
+		return 2
+	}
+	scan, code := scanForSearch(f, kind, stderr)
+	if code != 0 {
+		return code
+	}
+	candidates := filterForSearch(f, scan.Sessions, stderr)
+	var hits []secretHit
+	for _, s := range candidates {
+		if s.Compressed {
+			continue
+		}
+		data, rerr := os.ReadFile(s.Path)
+		if rerr != nil {
+			continue
+		}
+		if found := secrets.Scan(data); len(found) > 0 {
+			hits = append(hits, secretHit{Session: s, Findings: found})
+		}
+	}
+	compressedSkipped := countCompressedSessions(candidates)
+	if f.jsonOut {
+		printScanJSON(stdout, hits, compressedSkipped)
+	} else {
+		printScan(stdout, kind, hits)
+		printCompressedSkipNote(stdout, compressedSkipped)
+	}
+	return 0
+}
+
+func runExport(args []string, stdout, stderr io.Writer) int {
+	f, err := parseFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	kind, ok := resolveTool(f, stderr)
+	if !ok {
+		return 2
+	}
+	home, ok := resolveHome(f, stderr)
+	if !ok {
+		return 1
+	}
+	var claudeHome claudehome.Home
+	if kind == agent.Claude {
+		claudeHome, ok = resolveClaudeHome(f, stderr)
+		if !ok {
+			return 1
+		}
+	}
+
+	if f.all && len(f.projects) > 0 {
+		fmt.Fprintln(stderr, "error: --all and --project are mutually exclusive")
+		return 2
+	}
+	// Export targets exactly one session; import can take several. Reject more
+	// than one --session here so the single-session output name stays meaningful.
+	if len(f.sessions) > 1 {
+		fmt.Fprintln(stderr, "error: export accepts only one --session (use --all to export several)")
+		return 2
+	}
+	session := ""
+	if len(f.sessions) == 1 {
+		session = f.sessions[0]
+	}
+	if session != "" && (f.all || len(f.projects) > 0) {
+		fmt.Fprintln(stderr, "error: --session cannot be combined with --all or --project")
+		return 2
+	}
+
+	encryptRequested := len(f.encryptTo) > 0 || f.recipientsFile != "" || f.passphrase
+	if f.passphrase && (len(f.encryptTo) > 0 || f.recipientsFile != "") {
+		fmt.Fprintln(stderr, "error: --passphrase cannot be combined with --encrypt-to or --recipients-file")
+		return 2
+	}
+	if encryptRequested && !crypt.Available() {
+		fmt.Fprintln(stderr, "error: "+ageMissingMessage)
+		return 1
+	}
+
+	var since time.Time
+	if f.since != "" {
+		since, err = parseSince(f.since)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 2
+		}
+	}
+
+	// --project is repeatable for a selected multi-project handoff. Without
+	// --all, --session, or --match, export the current project by default.
+	var absProjects []string
+	if !f.all && session == "" {
+		projects := append([]string(nil), f.projects...)
+		// Default to the current project — unless --match is given, which searches
+		// across all projects by content.
+		if len(projects) == 0 && f.match == "" {
+			projects = []string{"."}
+		}
+		for _, project := range projects {
+			absProject, err := filepath.Abs(project)
+			if err != nil {
+				fmt.Fprintf(stderr, "error: cannot resolve project path %q: %v\n", project, err)
+				return 1
+			}
+			duplicate := false
+			for _, existing := range absProjects {
+				if pathEqualCLI(existing, absProject) {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				absProjects = append(absProjects, absProject)
+			}
+		}
+	}
+	var absProject string
+	if len(absProjects) == 1 {
+		absProject = absProjects[0]
+	}
+	projectGitURLs, err := parseProjectGitURLs(f.projectGit, absProjects)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+
+	// Opt-in --git-push completes the handoff: it pushes the project's code to its
+	// own git remote so the commit recorded in the bundle is actually fetchable on
+	// the other machine. It pushes CODE to YOUR remote only — never sessions, never
+	// to any cct server — and runs before the export so the bundle records
+	// the now-pushed state. It is scoped to a single project (not --all/--session).
+	if f.gitPush {
+		if len(absProjects) > 1 {
+			fmt.Fprintln(stderr, "error: --git-push cannot be used with multiple --project values")
+			return 2
+		}
+		if code := pushProject(absProject, session, f.all, stdout, stderr); code != 0 {
+			return code
+		}
+	}
+
+	output := f.output
+	if output == "" {
+		switch {
+		case session != "":
+			output = "session-" + sanitizeForFilename(session) + ".codexbundle"
+		case f.all:
+			if kind == agent.Claude {
+				output = "claude-sessions.codexbundle"
+			} else {
+				output = "codex-sessions.codexbundle"
+			}
+		case absProject == "" && f.match != "":
+			output = "matched-sessions.codexbundle"
+		case len(absProjects) > 1:
+			output = "codex-project-handoff.codexbundle"
+		default:
+			output = defaultBundleName(absProject)
+		}
+	}
+
+	// --format md|html renders a readable document instead of a bundle (not
+	// re-importable).
+	if f.format != "" {
+		if len(absProjects) > 1 {
+			fmt.Fprintln(stderr, "error: --format does not support multiple --project values; write a bundle instead")
+			return 2
+		}
+		return runExportRendered(f, kind, home, claudeHome, absProject, session, since, stdout, stderr)
+	}
+
+	result, err := bundle.Export(home, bundle.ExportOptions{
+		Tool:               kind,
+		ClaudeHome:         claudeHome,
+		ProjectPath:        absProject,
+		ProjectPaths:       absProjects,
+		ProjectGitURLs:     projectGitURLs,
+		OutputPath:         output,
+		IncludeArchived:    f.includeArchived,
+		Since:              since,
+		SessionID:          session,
+		WithGit:            f.withGit,
+		WithMemory:         f.withMemory,
+		StripImages:        f.stripImages,
+		Redact:             f.redact,
+		Match:              f.match,
+		MatchRegex:         f.regex,
+		MatchCaseSensitive: f.caseSensitive,
+	})
+	if err != nil {
+		for _, w := range result.Warnings {
+			fmt.Fprintf(stderr, "warning: %s\n", w)
+		}
+		fmt.Fprintf(stderr, "error: export failed: %v\n", err)
+		return 1
+	}
+
+	// Pre-egress secret gate: a bundle is made to be moved/shared, so refuse to
+	// leave one full of credentials on disk unless the user redacts them or opts
+	// in. Scans the exact bytes that were written (after any --strip-images).
+	if !f.redact && !f.allowSecrets {
+		sres, serr := bundle.ScanBundleSecrets(output)
+		if serr == nil && sres.Any() {
+			os.Remove(output)
+			fmt.Fprintf(stderr, "error: this bundle would contain %s (in %s).\n",
+				plural(sres.TotalFindings, "likely secret"), plural(sres.SessionsWithSecrets, "session"))
+			fmt.Fprintln(stderr, "Refusing to write it so credentials don't leak. Re-run with --redact to replace")
+			fmt.Fprintln(stderr, "them with placeholders, --allow-secrets to export anyway, or `cct scan` to review.")
+			return 1
+		}
+	}
+
+	if encryptRequested {
+		encPath := output + crypt.Extension
+		err := crypt.Encrypt(output, encPath, crypt.EncryptOptions{
+			Recipients:     f.encryptTo,
+			RecipientsFile: f.recipientsFile,
+			Passphrase:     f.passphrase,
+		})
+		// The plaintext bundle is intermediate; remove it whether or not
+		// encryption succeeded so a clear bundle is never left behind.
+		os.Remove(output)
+		if err != nil {
+			os.Remove(encPath)
+			fmt.Fprintf(stderr, "error: encrypt failed: %v\n", err)
+			return 1
+		}
+		result.BundlePath = encPath
+	}
+
+	if f.jsonOut {
+		printExportJSON(stdout, result)
+	} else {
+		printExport(stdout, kind, absProjects, session, result)
+	}
+	return 0
+}
+
+// ageMissingMessage is the shared guidance shown when encryption/decryption is
+// requested but the age binary is not installed.
+const ageMissingMessage = "age is not installed or not on PATH; install age (https://github.com/FiloSottile/age) to use bundle encryption"
+
+// parseSince delegates to bundle.ParseSince so the CLI and the desktop UI share
+// one definition of the --since grammar (a date or a d/h/m duration).
+// runExportRendered renders selected sessions as a readable document — Markdown
+// or self-contained HTML — for reading/sharing (not re-import). One session writes
+// a single file; several write a directory of files.
+func runExportRendered(f commonFlags, kind agent.Kind, home codexhome.Home, claudeHome claudehome.Home, absProject, session string, since time.Time, stdout, stderr io.Writer) int {
+	var ext string
+	var toDoc func(handoff.AgentSession) []byte
+	switch f.format {
+	case "md", "markdown":
+		ext, toDoc = ".md", handoff.ToMarkdown
+	case "html", "htm":
+		ext, toDoc = ".html", handoff.ToHTML
+	default:
+		fmt.Fprintf(stderr, "error: unknown --format %q (supported: md, html)\n", f.format)
+		return 2
+	}
+	scan, code := scanForSearch(f, kind, stderr)
+	if code != 0 {
+		return code
+	}
+	var selected []sessions.Session
+	if session != "" {
+		sel, err := selectByThreadIDCLI(scan.Sessions, session)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		selected = sel
+	} else {
+		q := search.Query{Text: f.match, Regex: f.regex, CaseSensitive: f.caseSensitive}
+		for _, s := range scan.Sessions {
+			if s.Compressed || s.ThreadID == "" {
+				continue
+			}
+			if !since.IsZero() && s.ModTime.Before(since) {
+				continue
+			}
+			if absProject != "" && (s.CWD == "" || !pathEqualCLI(s.CWD, absProject)) {
+				continue
+			}
+			if f.match != "" {
+				ok, err := search.SessionMatches(s.Path, q)
+				if err != nil || !ok {
+					continue
+				}
+			}
+			selected = append(selected, s)
+		}
+	}
+	if len(selected) == 0 {
+		fmt.Fprintln(stderr, "error: no sessions selected for Markdown export")
+		return 1
+	}
+
+	render := func(s sessions.Session) ([]byte, error) {
+		var as handoff.AgentSession
+		var err error
+		if kind == agent.Claude {
+			as, err = handoff.FromClaudeTranscript(s.Path)
+		} else {
+			as, err = handoff.FromCodexRollout(s.Path)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return toDoc(as), nil
+	}
+
+	if len(selected) == 1 {
+		out := f.output
+		if out == "" {
+			out = sanitizeForFilename(selected[0].ThreadID) + ext
+		}
+		doc, err := render(selected[0])
+		if err != nil {
+			fmt.Fprintf(stderr, "error: render: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(out, doc, 0o644); err != nil {
+			fmt.Fprintf(stderr, "error: write %s: %v\n", out, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Wrote %s\n", out)
+		return 0
+	}
+
+	dir := f.output
+	if dir == "" {
+		dir = "sessions-" + strings.TrimPrefix(ext, ".")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "error: create %s: %v\n", dir, err)
+		return 1
+	}
+	written := 0
+	for _, s := range selected {
+		doc, err := render(s)
+		if err != nil {
+			fmt.Fprintf(stderr, "warning: skipping %s: %v\n", s.ThreadID, err)
+			continue
+		}
+		p := filepath.Join(dir, sanitizeForFilename(s.ThreadID)+ext)
+		if err := os.WriteFile(p, doc, 0o644); err != nil {
+			fmt.Fprintf(stderr, "warning: write %s: %v\n", p, err)
+			continue
+		}
+		written++
+	}
+	fmt.Fprintf(stdout, "Wrote %d file(s) to %s/\n", written, dir)
+	return 0
+}
+
+// selectByThreadIDCLI returns the single session matching an exact thread id or a
+// unique prefix.
+func selectByThreadIDCLI(list []sessions.Session, idPrefix string) ([]sessions.Session, error) {
+	var prefix []sessions.Session
+	for _, s := range list {
+		if s.ThreadID == idPrefix {
+			return []sessions.Session{s}, nil
+		}
+		if s.ThreadID != "" && strings.HasPrefix(s.ThreadID, idPrefix) {
+			prefix = append(prefix, s)
+		}
+	}
+	switch len(prefix) {
+	case 0:
+		return nil, fmt.Errorf("no session matches %q", idPrefix)
+	case 1:
+		return prefix, nil
+	default:
+		return nil, fmt.Errorf("%q is ambiguous (%d matches); use a longer id", idPrefix, len(prefix))
+	}
+}
+
+// pathEqualCLI compares two filesystem paths after cleaning, case-insensitively on
+// Windows.
+func pathEqualCLI(a, b string) bool {
+	ca, cb := filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(ca, cb)
+	}
+	return ca == cb
+}
+
+// parseProjectGitURLs validates repeatable --project-git PROJECT=REMOTE values.
+// The project must be one of the selected --project paths, and the remote is
+// sanitized before it can reach the portable manifest.
+func parseProjectGitURLs(values, selected []string) (map[string]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(values))
+	for _, value := range values {
+		i := strings.IndexByte(value, '=')
+		if i <= 0 || i == len(value)-1 {
+			return nil, fmt.Errorf("invalid --project-git %q: expected PROJECT=REMOTE", value)
+		}
+		project, err := filepath.Abs(strings.TrimSpace(value[:i]))
+		if err != nil {
+			return nil, fmt.Errorf("invalid --project-git project %q: %v", value[:i], err)
+		}
+		selectedProject := false
+		for _, candidate := range selected {
+			if pathEqualCLI(candidate, project) {
+				selectedProject = true
+				project = candidate
+				break
+			}
+		}
+		if !selectedProject {
+			return nil, fmt.Errorf("--project-git project %q is not one of the selected --project paths", project)
+		}
+		remote := git.SanitizeRemoteURL(strings.TrimSpace(value[i+1:]))
+		if err := git.ValidateRemoteURL(remote); err != nil {
+			return nil, fmt.Errorf("invalid --project-git remote for %q: %v", project, err)
+		}
+		if _, duplicate := out[project]; duplicate {
+			return nil, fmt.Errorf("duplicate --project-git for %q", project)
+		}
+		out[project] = remote
+	}
+	return out, nil
+}
+
+func parseSince(s string) (time.Time, error) {
+	return bundle.ParseSince(s)
+}
+
+// sanitizeForFilename keeps only characters safe in a filename (thread ids are
+// UUIDs, so this is just a guard against an unexpected prefix value).
+func sanitizeForFilename(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return "codex-session"
+	}
+	return out
+}
+
+// defaultBundleName derives <project-base>.codexbundle in the current directory.
+func defaultBundleName(absProject string) string {
+	base := filepath.Base(absProject)
+	if base == "." || base == string(filepath.Separator) || base == "" {
+		base = "codex-sessions"
+	}
+	return base + ".codexbundle"
+}
+
+func runInspect(args []string, stdout, stderr io.Writer) int {
+	f, err := parseFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	if len(f.positional) != 1 {
+		fmt.Fprintln(stderr, "usage: cct inspect <file.codexbundle>")
+		return 2
+	}
+	bundlePath, cleanup, code := resolveBundlePath(f, stderr)
+	if code != 0 {
+		return code
+	}
+	defer cleanup()
+
+	res, err := bundle.Inspect(bundlePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if f.jsonOut {
+		printInspectJSON(stdout, f.positional[0], res)
+	} else {
+		printInspect(stdout, f.positional[0], res)
+	}
+	return 0
+}
+
+// resolveBundlePath returns a plaintext bundle path usable by inspect/import. If
+// the positional input is an encrypted (.age) bundle, it is decrypted to a
+// temporary file (requiring --identity or --passphrase) and the returned cleanup
+// removes that temporary file. For a plain bundle the input is returned as-is
+// with a no-op cleanup. The returned code is non-zero on error.
+func resolveBundlePath(f commonFlags, stderr io.Writer) (string, func(), int) {
+	in := f.positional[0]
+	noop := func() {}
+	if !strings.EqualFold(filepath.Ext(in), crypt.Extension) {
+		return in, noop, 0
+	}
+	if f.identity == "" && !f.passphrase {
+		fmt.Fprintln(stderr, "error: "+in+" is an encrypted bundle; pass --identity <file> or --passphrase to decrypt it")
+		return "", noop, 2
+	}
+	if !crypt.Available() {
+		fmt.Fprintln(stderr, "error: "+ageMissingMessage)
+		return "", noop, 1
+	}
+	tmpDir, err := os.MkdirTemp("", "cct-dec-")
+	if err != nil {
+		fmt.Fprintf(stderr, "error: cannot create temp dir: %v\n", err)
+		return "", noop, 1
+	}
+	cleanup := func() { os.RemoveAll(tmpDir) }
+	// Fixed inner name in a fresh dir so age never refuses to overwrite.
+	out := filepath.Join(tmpDir, "bundle.codexbundle")
+	if err := crypt.Decrypt(in, out, crypt.DecryptOptions{
+		IdentityFile: f.identity,
+		Passphrase:   f.passphrase,
+	}); err != nil {
+		cleanup()
+		fmt.Fprintf(stderr, "error: decrypt failed: %v\n", err)
+		return "", noop, 1
+	}
+	return out, cleanup, 0
+}
+
+func runImport(args []string, stdout, stderr io.Writer) int {
+	f, err := parseFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	if len(f.positional) != 1 {
+		fmt.Fprintln(stderr, "usage: cct import <file.codexbundle> [--dry-run] [--merge] [--reconcile] [--session <id>] [--project <path>] [--map-cwd OLD=NEW | --map-cwd-here] [--replace-with-backup] [--import-as-copy] [--clone <dir>]")
+		return 2
+	}
+	if f.replaceBackup && f.importAsCopy {
+		fmt.Fprintln(stderr, "error: --replace-with-backup and --import-as-copy are mutually exclusive (they resolve conflicts in opposite ways)")
+		return 2
+	}
+	if f.reconcile && f.dryRun {
+		fmt.Fprintln(stderr, "error: --reconcile cannot be combined with --dry-run (there are no imported threads to reconcile)")
+		return 2
+	}
+	if f.reconcile && f.to != "" {
+		fmt.Fprintln(stderr, "error: --reconcile is not yet supported with cross-agent --to imports")
+		return 2
+	}
+
+	var absProject string
+	if f.project != "" {
+		absProject, err = filepath.Abs(f.project)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: cannot resolve project path %q: %v\n", f.project, err)
+			return 1
+		}
+	}
+
+	var since time.Time
+	if f.since != "" {
+		since, err = parseSince(f.since)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 2
+		}
+	}
+
+	if f.mapCWDHere && len(f.mapCWD) > 0 {
+		fmt.Fprintln(stderr, "error: --map-cwd and --map-cwd-here are mutually exclusive (use one or the other)")
+		return 2
+	}
+	mappings, err := bundle.ParseCWDMappings(f.mapCWD)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	var hereDir string
+	if f.mapCWDHere {
+		hereDir, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintf(stderr, "error: --map-cwd-here: cannot determine the current directory: %v\n", err)
+			return 1
+		}
+	}
+
+	bundlePath, cleanup, code := resolveBundlePath(f, stderr)
+	if code != 0 {
+		return code
+	}
+	defer cleanup()
+
+	// --to turns import into a cross-agent handoff: translate the bundle's sessions
+	// into the other agent's format and write them into that agent's home.
+	if f.to != "" {
+		return runTranslateImport(f, bundlePath, stdout, stderr)
+	}
+
+	// The bundle records which agent it came from; that, not --tool, decides where
+	// the sessions are written. Resolve the matching home, and if --tool was given
+	// and disagrees with the bundle, follow the bundle (and say so).
+	kind, home, ok := resolveImportTarget(f, bundlePath, stderr)
+	if !ok {
+		return 1
+	}
+	if f.reconcile && kind != agent.Codex {
+		fmt.Fprintln(stderr, "error: --reconcile applies only to Codex imports")
+		return 2
+	}
+
+	res, err := bundle.Import(home, bundle.ImportOptions{
+		BundlePath:         bundlePath,
+		DryRun:             f.dryRun,
+		IncludeArchived:    f.includeArchived,
+		ProjectPath:        absProject,
+		ProjectFilter:      absProject != "",
+		Since:              since,
+		Match:              f.match,
+		MatchRegex:         f.regex,
+		MatchCaseSensitive: f.caseSensitive,
+		MapCWD:             mappings,
+		MapCWDHere:         f.mapCWDHere,
+		HereDir:            hereDir,
+		ReplaceWithBackup:  f.replaceBackup,
+		ImportAsCopy:       f.importAsCopy,
+		Merge:              f.merge,
+		WithMemory:         f.withMemory,
+		SessionIDs:         f.sessions,
+		RecordUndo:         !f.dryRun,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "error: import failed: %v\n", err)
+		return 1
+	}
+	if !f.dryRun {
+		recordUndoJournal(f, kind, home, f.positional[0], res, stderr)
+	}
+	reconcile := postImportReconcile{Requested: f.reconcile}
+	if f.reconcile {
+		reconcile.CodexHome = home.Root
+		var changed codexreconcile.ImportThreads
+		changed, reconcile.Err = codexreconcile.ThreadsChangedByImport(home, res)
+		reconcile.ThreadIDs = changed.IDs
+		reconcile.UnknownThreadIDs = changed.Unknown
+		if reconcile.Err == nil {
+			reconcile.Result, reconcile.Err = codexreconcile.Reconcile(context.Background(), codexreconcile.Options{
+				CodexHome: home.Root,
+				ThreadIDs: reconcile.ThreadIDs,
+			})
+		}
+		if reconcile.Err == nil && reconcile.UnknownThreadIDs > 0 {
+			reconcile.Err = fmt.Errorf("could not determine an exact thread ID for %d affected rollout(s)", reconcile.UnknownThreadIDs)
+		}
+	}
+	if f.jsonOut {
+		printImportJSON(stdout, f.positional[0], res, reconcile)
+	} else {
+		printImport(stdout, kind, f.positional[0], res, f.reconcile)
+		printPostImportReconcile(stdout, reconcile)
+	}
+
+	if f.cloneDir != "" {
+		// In --json mode keep stdout pure JSON: clone progress goes to stderr.
+		cloneOut := stdout
+		if f.jsonOut {
+			cloneOut = stderr
+		}
+		if code := cloneProject(f, res, cloneOut, stderr); code != 0 {
+			return code
+		}
+	}
+	return 0
+}
+
+type postImportReconcile struct {
+	Requested        bool
+	CodexHome        string
+	ThreadIDs        []string
+	UnknownThreadIDs int
+	Result           codexreconcile.Result
+	Err              error
+}
+
+// runRepairTimes resets the modification time of session files that were imported
+// with a wrong (import-time) mtime, so the agent stops re-parsing them on every
+// open. It only changes file mtimes — never content, never the index/SQLite.
+func runRepairTimes(args []string, stdout, stderr io.Writer) int {
+	f, err := parseFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	kind, ok := resolveTool(f, stderr)
+	if !ok {
+		return 2
+	}
+	var dirs []string
+	if kind == agent.Claude {
+		home, ok := resolveClaudeHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		dirs = []string{home.ProjectsDir}
+	} else {
+		home, ok := resolveHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		dirs = []string{home.SessionsDir}
+		if f.includeArchived {
+			dirs = append(dirs, home.ArchivedSessionsDir)
+		}
+	}
+	res, err := repair.RepairTimes(dirs, repair.Options{DryRun: f.dryRun})
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	printRepair(stdout, kind, res)
+	return 0
+}
+
+const syncUsage = `usage: cct sync <serve | connect [host:port] | daemon> --i-understand [options]
+  serve                wait for a device on your LAN to connect; prints a pairing code
+  connect [host:port]  connect to a serving device; needs --code. Omit host:port to
+                       auto-discover a serving/daemon peer on your LAN
+  daemon               ambient mode: watch your sessions and keep them in sync with
+                       remembered peers on your LAN automatically (no code needed)
+options: [--tool codex|claude] [--project <path>] [--code <code>] [--port <n>]
+         [--dry-run] [--pull-only | --push-only] [--allow-public] [--remember]
+         [--redact | --allow-secrets] [--interval <n>] [--once]
+
+EXPERIMENTAL: sync sends your sessions over the local network to a paired device.
+It is peer-to-peer (no server/cloud), refuses non-private addresses, and requires
+--i-understand to run. The daemon only ever talks to peers you have remembered.`
+
+// runSync drives the experimental LAN sync (serve/connect). The actual transfer
+// reuses the bundle export + import(--merge) path, so all safety properties hold.
+func runSync(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, syncUsage)
+		return 2
+	}
+	sub := args[0]
+	if sub != "serve" && sub != "connect" && sub != "daemon" {
+		fmt.Fprintf(stderr, "unknown sync subcommand %q\n\n%s\n", sub, syncUsage)
+		return 2
+	}
+	f, err := parseFlags(args[1:])
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	if f.pullOnly && f.pushOnly {
+		fmt.Fprintln(stderr, "error: --pull-only and --push-only are mutually exclusive")
+		return 2
+	}
+	if f.mapCWDHere && len(f.mapCWD) > 0 {
+		fmt.Fprintln(stderr, "error: --map-cwd and --map-cwd-here are mutually exclusive (use one or the other)")
+		return 2
+	}
+	mappings, err := bundle.ParseCWDMappings(f.mapCWD)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	var hereDir string
+	if f.mapCWDHere {
+		hereDir, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintf(stderr, "error: --map-cwd-here: cannot determine the current directory: %v\n", err)
+			return 1
+		}
+	}
+	kind, ok := resolveTool(f, stderr)
+	if !ok {
+		return 2
+	}
+	// In --json mode stdout must stay pure JSON, so progress/UX goes to stderr.
+	uxOut := stdout
+	if f.jsonOut {
+		uxOut = stderr
+	}
+	opts := lansync.Options{
+		Tool:         kind,
+		AllowPublic:  f.allowPublic,
+		PullOnly:     f.pullOnly,
+		PushOnly:     f.pushOnly,
+		DryRun:       f.dryRun,
+		Confirmed:    f.iUnderstand,
+		Code:         f.code,
+		Port:         f.port,
+		Out:          uxOut,
+		MapCWD:       mappings,
+		MapCWDHere:   f.mapCWDHere,
+		HereDir:      hereDir,
+		Remember:     f.remember,
+		Redact:       f.redact,
+		AllowSecrets: f.allowSecrets,
+	}
+	var home codexhome.Home
+	if kind == agent.Claude {
+		clh, ok := resolveClaudeHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		opts.ClaudeHome = clh
+		home = codexhome.Home{Root: clh.Root}
+	} else {
+		h, ok := resolveHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		home = h
+	}
+	if f.project != "" {
+		abs, aerr := filepath.Abs(f.project)
+		if aerr != nil {
+			fmt.Fprintf(stderr, "error: cannot resolve project path %q: %v\n", f.project, aerr)
+			return 1
+		}
+		opts.ProjectPath = abs
+	}
+
+	if sub == "daemon" {
+		return runSyncDaemon(home, opts, f, uxOut, stderr)
+	}
+
+	var res lansync.Result
+	if sub == "serve" {
+		res, err = lansync.Serve(home, opts)
+	} else {
+		hostport, hcode := resolveConnectTarget(f, opts, uxOut, stderr)
+		if hcode != 0 {
+			return hcode
+		}
+		// Prefer prompting for the code over --code so the secret never lands in
+		// the shell's process list or history. --code stays as a scripting escape.
+		// A blank entry is allowed for an already-remembered device.
+		if opts.Code == "" {
+			fmt.Fprint(uxOut, "Enter the pairing code shown on the other device\n(or leave blank if this device is already remembered): ")
+			line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+			opts.Code = strings.TrimSpace(line)
+		}
+		res, err = lansync.Connect(home, opts, hostport)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if f.jsonOut {
+		printSyncJSON(stdout, res)
+	} else {
+		printSync(stdout, kind, res)
+	}
+	return 0
+}
+
+// runTranslateImport performs a cross-agent handoff: it reads the bundle (in
+// whatever agent's format it was exported), translates each session into the
+// --to agent's format, and writes the results into that agent's home. The
+// destination home is the --to agent's; the bundle's own tool is the source.
+func runTranslateImport(f commonFlags, bundlePath string, stdout, stderr io.Writer) int {
+	target, err := agent.Parse(f.to)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: --to %v\n", err)
+		return 2
+	}
+	var home codexhome.Home
+	if target == agent.Claude {
+		clh, ok := resolveClaudeHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		home = codexhome.Home{Root: clh.Root, SessionsDir: clh.ProjectsDir, Source: clh.Source}
+	} else {
+		h, ok := resolveHome(f, stderr)
+		if !ok {
+			return 1
+		}
+		home = h
+	}
+
+	res, err := bundle.TranslateImport(home, bundle.TranslateOptions{
+		BundlePath: bundlePath,
+		TargetTool: target,
+		DryRun:     f.dryRun,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "error: handoff failed: %v\n", err)
+		return 1
+	}
+	printTranslate(stdout, f.positional[0], res)
+	return 0
+}
+
+// pushProject handles the opt-in --git-push step on export: it pushes the
+// project's current branch to its git remote. This is the only outbound action
+// on export, it is explicit, and it uploads your code to your own remote — never
+// your sessions, and never to any cct service. It returns a non-zero exit
+// code on failure so the export aborts before writing a bundle that would
+// misleadingly claim a commit is fetchable.
+func pushProject(absProject, session string, all bool, stdout, stderr io.Writer) int {
+	if all || session != "" {
+		fmt.Fprintln(stderr, "error: --git-push pushes one project's code, so it is not valid with --all or --session")
+		return 2
+	}
+	if !git.Available() {
+		fmt.Fprintln(stderr, "error: git is not installed or not on PATH; cannot --git-push")
+		return 1
+	}
+	if !git.IsRepo(absProject) {
+		fmt.Fprintf(stderr, "error: %s is not a git repository; nothing to --git-push\n", absProject)
+		return 1
+	}
+	fmt.Fprintln(stdout, "Pushing your project's code to its git remote (--git-push)…")
+	remote, branch, err := git.Push(absProject)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: git push failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "Pushed branch %q to remote %q.\n", branch, remote)
+	fmt.Fprintln(stdout, "(This uploads your code to your own git remote only — cct never uploads your sessions.)")
+	fmt.Fprintln(stdout)
+	return 0
+}
+
+// cloneProject handles the opt-in --clone step: it clones the bundle's recorded
+// git remote into the target directory. It is intentionally separate from the
+// session import (which never touches the network or files outside Codex home).
+func cloneProject(f commonFlags, res bundle.ImportResult, stdout, stderr io.Writer) int {
+	if f.dryRun {
+		fmt.Fprintln(stdout, "\n--clone skipped because --dry-run was used.")
+		return 0
+	}
+	gi := res.Manifest.Git
+	if gi == nil || gi.RemoteURL == "" {
+		fmt.Fprintln(stderr, "error: --clone given but the bundle records no git remote URL")
+		return 1
+	}
+	fmt.Fprintf(stdout, "\nCloning %s into %s ...\n", gi.RemoteURL, f.cloneDir)
+	if err := git.Clone(gi.RemoteURL, f.cloneDir, gi.CommitSHA); err != nil {
+		fmt.Fprintf(stderr, "error: clone failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "Clone complete.")
+	if gi.CommitSHA != "" {
+		fmt.Fprintf(stdout, "Checked out commit %s.\n", gi.CommitSHA)
+	}
+	abs, err := filepath.Abs(f.cloneDir)
+	if err == nil {
+		fmt.Fprintf(stdout, "If the session's recorded cwd differs from %s, re-import with\n--map-cwd \"<old-cwd>=%s\" so it appears under that project in Codex.\n", abs, abs)
+	}
+	return 0
+}
+
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprint(w, `cct — Codex & Claude Code session transfer (unofficial)
+
+  Export. Move. Import. Continue your local coding-agent sessions on another machine.
+  Works with both Codex (~/.codex) and Claude Code (~/.claude); pick one with --tool.
+
+Usage:
+  cct <command> [flags]
+
+Commands:
+  doctor    Read-only health check: find your Codex home, count sessions,
+            and confirm SQLite will not be modified
+  list      List discovered Codex sessions (preview, thread id, cwd, time)
+  search    Full-text search across your sessions' conversation text
+  scan      Check sessions for likely secrets (API keys, tokens) before sharing
+  stats     Summarize your sessions: totals, busiest projects, recent activity
+  resume    Find the best-matching session and print (or --run) the agent
+            command that continues it
+  browse    Interactive session browser: search, pick one, then resume/export/tag
+  tag       Add/remove/list cct-only tags on a session (tag add|rm|ls)
+  name      Give a session a friendly cct-only name
+  config    Save user defaults (tool, homes, port) so you stop retyping flags
+  skill     Install the agent workflow skill: keep this project's sessions in
+            git — a separate private session store, or the project's own repo —
+            and restore them after a clone. 'skill init' points a project at
+            that store, 'skill show' explains it, 'skill print --plain' emits
+            the instructions for Codex's AGENTS.md
+  export    Export sessions for a project into a .codexbundle
+            (--format md|html writes a readable document instead of a bundle;
+             --match <q> bundles only sessions whose text matches;
+             --redact replaces detected secrets with placeholders. By default
+             export refuses to write a bundle that contains a likely secret;
+             use --redact or --allow-secrets)
+  inspect   Show a bundle's manifest and contents, read-only (no extraction)
+  diff      Preview what importing a bundle would do (new / grow / conflict),
+            read-only — nothing is written
+  import    Import a .codexbundle into your Codex home (never overwrites).
+		    Filter with --session/--project/--since/--match; use --reconcile
+		    to ask Codex to discover and verify changed rollouts immediately
+  relocate  Rewrite a project's session cwd after its folder moves;
+		    --move-project also renames the project directory. With
+		    --tool claude the transcripts move to the new project folder
+  undo      Reverse the most recent import or relocation (delete created files,
+            restore backups and removed transcripts); --list shows recent
+            imports, --dry-run previews
+  repair-times  Reset imported session files' modification time to their real
+            last-activity time, so the agent stops re-parsing them on every open
+            (a one-time fix; only changes mtimes, never content or the index)
+  sync      EXPERIMENTAL device-to-device sync over your local network:
+            'sync serve' waits for a peer, 'sync connect [host:port]' joins it
+            (omit the address to auto-discover a peer on your LAN), and
+            'sync daemon' keeps remembered peers in sync automatically.
+            Peer-to-peer (no server/cloud), authenticated with a one-time code,
+            refuses non-private addresses; requires --i-understand
+  ui        Interactive mode: a guided menu that builds and runs the commands
+            below for you (shows the equivalent command each time)
+  app       Launch the local desktop GUI in your browser (loopback-only,
+            nothing is uploaded)
+  version   Print the cct version (also --version)
+  completion Print a shell completion script (bash, zsh, or fish)
+  help      Show this help
+
+Flags:
+  --tool <codex|claude> Which agent's sessions to act on. Default: auto-detect
+                        (Claude Code if only its home exists, otherwise Codex).
+                        On import the bundle's recorded tool always wins.
+  --codex-home <path>   Use a specific Codex home instead of ~/.codex
+                        (also honors $CODEX_HOME)
+  --claude-home <path>  Use a specific Claude Code home instead of ~/.claude
+                        (also honors $CLAUDE_HOME)
+  --include-archived    list/export/relocate: also consider archived sessions;
+                        import: restore archived sessions into archived_sessions
+                        (Codex only; Claude Code has no separate archive)
+  --json                doctor/list/inspect/export/import/relocate: print a
+                        machine-readable JSON summary on stdout instead of text
+  --port <n>            app: serve the desktop GUI on this port (default: a free
+                        port chosen automatically)
+  --no-browser          app: do not auto-open the browser; just print the URL
+  --project <path>      export: filter sessions by recorded cwd
+                        import/diff: import only sessions whose recorded cwd is
+                        <path> (pull one project out of a multi-project bundle)
+  --all                 export: include every session (no cwd filter);
+                        mutually exclusive with --project
+  --session <id>        export: export only the session with this thread id
+                        (a unique prefix is enough); ignores cwd filtering
+                        import/diff: act only on the session(s) with this thread
+                        id (a unique prefix is enough); repeatable to pick several
+  --since <when>        export/import/diff: only sessions updated at/after <when>,
+                        where <when> is a date (YYYY-MM-DD) or a duration
+                        (7d, 48h, 90m). On import/diff it filters the bundle
+  --match <q>           export/import/diff: only sessions whose conversation text
+                        matches <q> (with --regex/--case-sensitive). On import/diff
+                        it filters the bundle; .jsonl.zst sessions are skipped
+  --with-git            export: also record the project's git remote/branch/
+                        commit (and dirty/unpushed status) in the bundle, even
+                        with --all or --session
+  --project-git P=URL   export: supply/override the Git URL for selected project
+                        P (repeatable). Useful when the original folder is gone;
+                        credentials and URL query parameters are stripped
+  --with-memory         export/import (Claude Code): also carry the projects'
+                        auto memory (projects/<encoded-cwd>/memory/). Opt-in on
+                        both sides — Claude keeps it machine-local by design.
+                        Import never overwrites a memory file that differs
+  --git-push            export: push the project's current branch to its git
+                        remote first, so the recorded commit is fetchable on the
+                        other machine. Uploads your code to your own remote only,
+                        never your sessions. Opt-in; needs a project and a remote
+  --strip-images        export: replace inline base64 images in each session with
+                        a small placeholder, to shrink an image-heavy bundle.
+                        Lossy (the pictures are dropped) and opt-in; the
+                        conversation text is kept. Needs zstd for .jsonl.zst
+  --output, -o <path>   export: bundle output path (default <project>.codexbundle)
+  --dry-run             import: validate and report only, write nothing
+                        relocate: preview session rewrites and any directory move
+  --move-project        relocate: rename OLD to NEW before rewriting sessions;
+                        same-filesystem moves only (without it, NEW must exist)
+  --merge               import: incremental sync. When a session already exists
+                        locally but grew on the other device, append only the new
+                        messages (the local file is a prefix of the bundle's, so
+                        this is lossless). Sessions that changed on both sides stay
+                        conflicts; combine with --replace-with-backup/--import-as-
+                        copy to resolve those too
+  --reconcile           import (Codex only): after writing rollout files, ask a
+                        short-lived native Codex app-server to read missing thread
+                        IDs and verify them in thread/list. Capability-probed and
+                        best-effort; cct never writes SQLite/session_index itself
+  --to <codex|claude>   import: cross-agent handoff. Instead of importing the
+                        bundle's sessions natively, translate them into the OTHER
+                        agent's format and write them into that agent's home. A
+                        best-effort text handoff (conversation + a context
+                        preamble; tool calls summarized), not a perfect clone
+  --map-cwd OLD=NEW     import: rewrite a session's recorded cwd from OLD to NEW
+                        so it lands in the right local project (repeatable;
+                        plain .jsonl only — .zst sessions are not rewritten)
+  --map-cwd-here        import: shorthand for --map-cwd that maps the bundle's
+                        recorded project to the directory you run this from, so
+                        you don't have to look up the old path. The sessions then
+                        appear under the current folder's project (in Claude Code,
+                        its sidebar group). Only for a single-project bundle; a
+                        bundle spanning several projects is rejected as ambiguous
+                        (use --map-cwd for those). Cannot be combined with --map-cwd
+  --replace-with-backup import: on a conflict (a local session changed since a
+                        previous import), overwrite the local file with the
+                        bundle's version after saving a backup next to it
+                        (default is to skip conflicts and never overwrite)
+  --import-as-copy      import: on a conflict, import the bundle's version as a
+                        brand-new session (fresh id + filename) instead of
+                        skipping it, leaving the local session untouched
+                        (mutually exclusive with --replace-with-backup;
+                        plain .jsonl only — .zst conflicts stay skipped)
+  --clone <dir>         import: after importing, clone the bundle's recorded git
+                        remote into <dir> and check out the recorded commit
+  --encrypt-to <rcpt>   export: encrypt the bundle to an age recipient
+                        (age1.../ssh-ed25519 ...) -> <output>.age (repeatable)
+  --recipients-file <f> export: encrypt to every age recipient listed in <f>
+  --passphrase          export: encrypt with an interactive passphrase
+                        import/inspect: decrypt a passphrase-encrypted bundle
+  --identity <file>     import/inspect: age identity (private key) file used to
+                        decrypt a .age bundle
+  --allow-secrets       export/sync: proceed even if a likely secret is detected
+                        in a session (the default refuses; --redact masks instead)
+  --run                 resume: launch the agent on the chosen session now,
+                        instead of just printing the command
+  --force               skill install: replace an installed SKILL.md that differs
+                        from this cct's (the old one is kept as a .cct-bak-* copy)
+  --plain               skill print: drop the skill frontmatter, so the text can
+                        be pasted into AGENTS.md or another agent's instructions
+  --repo <git-url>      skill init: the private session store this project's
+                        history lives in (default: config repo-sync-repo)
+  --interval <n>        sync daemon: seconds between change checks (default 5)
+  --once                sync daemon: run a single discover-and-sync sweep, then exit
+
+Optional external tools (only needed for the matching feature; the core commands
+need none):
+  age   encryption (--encrypt-to/--passphrase, decrypting .age bundles)
+        https://github.com/FiloSottile/age
+  git   --with-git on export and --clone on import
+  zstd  reading metadata of compressed .jsonl.zst sessions (export/list/inspect)
+        https://github.com/facebook/zstd
+If a tool is missing, the matching feature errors with guidance or is skipped;
+nothing else is affected. .age bundles are auto-detected on import/inspect.
+
+Examples:
+  cct ui                            # interactive, guided menu
+  cct doctor
+  cct doctor --tool claude          # check Claude Code instead of Codex
+  cct list
+  cct list --tool claude            # list Claude Code sessions
+  cct search "rate limiter"         # find sessions mentioning a topic
+  cct search "TODO|FIXME" --regex --since 30d
+  cct stats                         # totals, busiest projects, recent activity
+  cct resume "rate limiter"         # print the command to continue that session
+  cct resume "rate limiter" --run   # …or launch the agent on it now
+  cct browse                        # interactive: search → pick → resume/export
+  cct tag add 9f3c wip              # annotate a session (cct-only, never the agent)
+  cct name 9f3c "auth refactor"
+  cct config set tool claude        # save a default so you can drop --tool
+  cct skill install                 # teach your agent the save/restore-via-git flow
+  cct skill init                    # point this project at your private session store
+  cct skill show                    # …and explain where its history lives
+  cct scan                          # check sessions for likely secrets
+  cct export --match "rate limiter" # bundle only sessions about a topic
+  cct export --session 9f3c --format md -o chat.md   # readable Markdown
+  cct export --session 9f3c --format html -o chat.html  # shareable HTML
+  cct export --all --redact         # bundle with secrets replaced by placeholders
+  cct export --project .            # -> <project>.codexbundle
+  cct export --tool claude --project .   # export this project's Claude sessions
+  cct export --project . --with-git # also record git remote/commit
+  cct export --project . --strip-images  # drop embedded images to shrink it
+  cct export --all                  # -> codex-sessions.codexbundle
+  cct export --all --since 7d       # everything updated in the last 7 days
+  cct export --project . --since 2026-06-01
+  cct export --session 9f3c1a2b     # one session by thread-id prefix
+  cct inspect ./my-project.codexbundle
+  cct diff ./my-project.codexbundle       # preview: new / grow / conflict (read-only)
+  cct import ./my-project.codexbundle --dry-run
+  cct import ./my-project.codexbundle
+  cct import ./big.codexbundle --project . # import only THIS project's sessions
+  cct import ./big.codexbundle --since 7d  # import only recently-updated sessions
+  cct import ./big.codexbundle --match "auth"   # import only sessions about a topic
+  cct undo                                 # reverse the most recent import
+  cct undo --dry-run                       # …preview what undo would do first
+  cct import ./my-project.codexbundle --merge   # append new messages to grown sessions
+  cct import ./my-project.codexbundle --reconcile # make changed Codex threads discoverable now
+  cct import ./my-project.codexbundle --map-cwd "/old/path=/new/path"
+  cct import ./my-project.codexbundle --map-cwd-here   # group under the current folder
+  cct import ./my-project.codexbundle --replace-with-backup
+  cct import ./my-project.codexbundle --import-as-copy
+  cct relocate /old/project /new/project --dry-run
+  cct relocate /old/project /new/project --move-project
+  cct relocate /old/project /new/project --include-archived
+  cct relocate /old/project /new/project --tool claude
+  cct import ./my-project.codexbundle --to claude   # Codex bundle -> Claude Code
+  cct import ./claude.codexbundle      --to codex    # Claude bundle -> Codex
+  cct import ./my-project.codexbundle --clone ~/dev/project
+  cct repair-times --dry-run         # preview the mtime fix for imported sessions
+  cct repair-times                   # apply it (then restart Codex)
+  cct export --project . --encrypt-to age1qz...   # -> <project>.codexbundle.age
+  cct export --all --passphrase                   # passphrase-encrypted
+  cct import ./my-project.codexbundle.age --identity ~/.age/key.txt
+  cct inspect ./my-project.codexbundle.age --passphrase
+
+After importing, run the agent again (restart the Codex App, or relaunch Claude
+Code) so it discovers the imported session files.
+
+Notes:
+  cct never modifies Codex's SQLite state DB or Claude Code's ~/.claude.json;
+  each agent rebuilds its own index from the JSONL files on its next scan.
+  .codexbundle files may contain prompts, code, terminal output, paths, and
+  secrets — do not share them publicly. See docs/safety.md.
+`)
+}
