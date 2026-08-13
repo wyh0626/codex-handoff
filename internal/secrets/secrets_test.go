@@ -12,7 +12,9 @@ func TestScanDetects(t *testing.T) {
 		"OpenAI API key":    "OPENAI=sk-abcdefghijklmnopqrst1234",
 		"GitHub token":      "token ghp_0123456789abcdefghijklmnopqrstuvwxyz",
 		"Private key block": "-----BEGIN OPENSSH PRIVATE KEY-----",
-		"Google API key":    "AIzaabcdefghijklmnopqrstuvwxyz012345678",
+		// Assemble the fake fixture at runtime so repository secret scanners do
+		// not mistake this detector test for a committed credential.
+		"Google API key": "AI" + "za" + "abcdefghijklmnopqrstuvwxyz012345678",
 	}
 	for wantType, content := range cases {
 		found := Scan([]byte(content))
